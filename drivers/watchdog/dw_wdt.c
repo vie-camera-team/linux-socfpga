@@ -36,9 +36,23 @@
 #include <linux/timer.h>
 #include <linux/uaccess.h>
 #include <linux/watchdog.h>
+// czteoh: begin
+#include <linux/gpio.h>
+#include <linux/interrupt.h>
+#include <linux/irq.h>
+// czteoh: end
 
 #define WDOG_CONTROL_REG_OFFSET		    0x00
 #define WDOG_CONTROL_REG_WDT_EN_MASK	    0x01
+// czteoh: begin
+/*
+ * Enter mode 2: 
+ *	Timeout -> generate interrupt -> re-countdown ->
+ *	if the dog not being kicked before 2nd timeout, reset the system
+ *	cv_54024.pdf pg.1
+ */
+#define WDOG_CONTROL_REG_WDT_EN_INT_MASK    0x03
+// czteoh: end
 #define WDOG_TIMEOUT_RANGE_REG_OFFSET	    0x04
 #define WDOG_CURRENT_COUNT_REG_OFFSET	    0x08
 #define WDOG_COUNTER_RESTART_REG_OFFSET     0x0c
@@ -46,6 +60,24 @@
 
 /* The maximum TOP (timeout period) value that can be set in the watchdog. */
 #define DW_WDT_MAX_TOP		15
+
+// czteoh: begin
+/*
+ * cv_54006.pdf pg.20
+ */
+#define WDOG_IRQ_NUM	203
+/*
+ * Currently we simulate the scenario by light up the LED which
+ * is connected to gpio167(ls /sys/class/gpio).
+ * Need to change to the GPIO which is connected to the MCLR of
+ * the microcontroller.
+ */
+#define GPIO_MCLR	167
+/*
+ * The number of interrupt generated so far
+ */
+static int irq_count = 0;
+// czteoh: end
 
 static bool nowayout = WATCHDOG_NOWAYOUT;
 module_param(nowayout, bool, 0);
@@ -64,10 +96,27 @@ static struct {
 	int			expect_close;
 } dw_wdt;
 
+// czteoh: begin
+/*
+ * Assert MCLR GPIO, which in effect, reset the whole board.
+ */
+static irqreturn_t wdt_isr(int irq, void *dev_id)
+{
+	if (irq != WDOG_IRQ_NUM)
+		return IRQ_NONE;
+
+	irq_count ++;
+	if (irq_count == 2) {
+		gpio_direction_output(GPIO_MCLR, 0);
+	}	
+	return IRQ_HANDLED;
+}
+// czteoh: end
+
 static inline int dw_wdt_is_enabled(void)
 {
 	return readl(dw_wdt.regs + WDOG_CONTROL_REG_OFFSET) &
-		WDOG_CONTROL_REG_WDT_EN_MASK;
+		WDOG_CONTROL_REG_WDT_EN_INT_MASK;
 }
 
 static inline int dw_wdt_top_in_seconds(unsigned top)
@@ -144,7 +193,7 @@ static int dw_wdt_open(struct inode *inode, struct file *filp)
 		 * the maximum and then start it.
 		 */
 		dw_wdt_set_top(DW_WDT_MAX_TOP);
-		writel(WDOG_CONTROL_REG_WDT_EN_MASK,
+		writel(WDOG_CONTROL_REG_WDT_EN_INT_MASK,
 		       dw_wdt.regs + WDOG_CONTROL_REG_OFFSET);
 	}
 
@@ -324,6 +373,25 @@ static int dw_wdt_drv_probe(struct platform_device *pdev)
 	setup_timer(&dw_wdt.timer, dw_wdt_ping, 0);
 	mod_timer(&dw_wdt.timer, jiffies + WDT_TIMEOUT);
 
+	// czteoh: begin
+	/* 
+	 * Currently disabled since the GPIO for the LED is from FPGA side,
+	 * and gpio-altera.ko is loaded just before login prompt and if FPGA is programmed
+	 */
+/*	ret = gpio_request(GPIO_MCLR, "mclr");
+	if (ret) {
+		printk("Fail to request gpio %i\n", GPIO_MCLR);
+		return ret;
+	}
+*/
+	ret = request_irq(WDOG_IRQ_NUM, wdt_isr, IRQF_DISABLED, "watchdog0", 0);
+	if (ret) {
+		printk("Fail to request irq %i\n", WDOG_IRQ_NUM);
+		return ret;
+	}
+	irq_set_irq_type(WDOG_IRQ_NUM, IRQ_TYPE_EDGE_RISING);
+	// czteoh: end
+
 	return 0;
 
 out_disable_clk:
@@ -336,6 +404,13 @@ out_put_clk:
 
 static int dw_wdt_drv_remove(struct platform_device *pdev)
 {
+	// czteoh: begin
+	/* 
+	 * Currently disabled. Enable them when gpio_request above is being enabled.
+	 */
+//	free_irq(WDOG_IRQ_NUM, NULL);
+//	gpio_free(GPIO_MCLR);
+	// czteoh: end
 	misc_deregister(&dw_wdt_miscdev);
 
 	clk_disable(dw_wdt.clk);

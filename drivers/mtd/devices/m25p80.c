@@ -35,6 +35,8 @@
 #include <linux/spi/spi.h>
 #include <linux/spi/flash.h>
 
+#include <linux/notifier.h>
+#include <linux/reboot.h>
 /* Flash opcodes. */
 #define	OPCODE_WREN		0x06	/* Write enable */
 #define	OPCODE_RDSR		0x05	/* Read status register */
@@ -128,6 +130,10 @@ static inline struct m25p *mtd_to_m25p(struct mtd_info *mtd)
 {
 	return container_of(mtd, struct m25p, mtd);
 }
+
+//czteoh: begin
+static struct m25p *flash_reboot_notifier = NULL;
+//czteoh: end
 
 /****************************************************************************/
 
@@ -246,32 +252,31 @@ static inline int write_disable(struct m25p *flash)
  */
 static inline int set_4byte(struct m25p *flash, u32 jedec_id, int enable)
 {
-	int ret;
-	u8 val;
+	int status;
+	bool need_wren = false;
 
 	switch (JEDEC_MFR(jedec_id)) {
+	case CFI_MFR_ST: /* Micron, actually */
+		/* Some Micron need WREN command; all will accept it */
+		need_wren = true;
 	case CFI_MFR_MACRONIX:
 	case 0xEF /* winbond */:
-	case CFI_MFR_ST:
+		if (need_wren)
+			write_enable(flash);
+
 		flash->command[0] = enable ? OPCODE_EN4B : OPCODE_EX4B;
-		return spi_write(flash->spi, flash->command, 1);
+		status = spi_write(flash->spi, flash->command, 1);
+
+		if (need_wren)
+			write_disable(flash);
+
+		return status;
 	default:
+		printk("In case default.\n");
 		/* Spansion style */
 		flash->command[0] = OPCODE_BRWR;
 		flash->command[1] = enable << 7;
-		ret = spi_write(flash->spi, flash->command, 2);
-
-		/* verify the 4 byte mode is enabled */
-		flash->command[0] = OPCODE_BRRD;
-		spi_write_then_read(flash->spi, flash->command, 1, &val, 1);
-		if (val != enable << 7) {
-			dev_warn(&flash->spi->dev,
-				 "fallback to 3-byte address mode\n");
-			dev_warn(&flash->spi->dev,
-				 "maximum accessible size is 16MB\n");
-			flash->addr_width = 3;
-		}
-		return ret;
+		return spi_write(flash->spi, flash->command, 2);
 	}
 }
 
@@ -1216,6 +1221,22 @@ static const struct spi_device_id *jedec_probe(struct spi_device *spi)
 	return ERR_PTR(-ENODEV);
 }
 
+//czteoh: begin
+static int qspi_notify_sys(struct notifier_block *this, unsigned long code,
+	void *x)
+{
+	if (code == SYS_DOWN || code == SYS_HALT) {
+		set_4byte(flash_reboot_notifier, flash_reboot_notifier->info->jedec_id, 0);
+	}
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block qspi_notifier = {
+	.notifier_call = qspi_notify_sys,
+    	.next       = NULL,  
+    	.priority   = INT_MAX,  
+};
+//czteoh: end
 
 /*
  * board specific setup should have ensured the SPI clock used here
@@ -1231,7 +1252,6 @@ static int m25p_probe(struct spi_device *spi)
 	unsigned			i;
 	struct mtd_part_parser_data	ppdata;
 	struct device_node __maybe_unused *np = spi->dev.of_node;
-
 #ifdef CONFIG_MTD_OF_PARTS
 	if (!of_device_is_available(np))
 		return -ENODEV;
@@ -1441,6 +1461,12 @@ static int m25p_probe(struct spi_device *spi)
 			flash->addr_width = 3;
 	}
 
+	//czteoh: begin
+	flash_reboot_notifier = kmalloc(sizeof(struct m25p), GFP_ATOMIC);
+	memcpy(flash_reboot_notifier, flash, sizeof(struct m25p));
+	register_reboot_notifier(&qspi_notifier);
+	//czteoh: end
+
 	/* set up the VCR for 8 dummy cycles (instead of the default 15) */
 #define N25Q00_JEDEC_ID (0x20ba21)
 	if (info->jedec_id == N25Q00_JEDEC_ID) {
@@ -1483,7 +1509,6 @@ static int m25p_probe(struct spi_device *spi)
 			data ? data->parts : NULL,
 			data ? data->nr_parts : 0);
 }
-
 
 static int m25p_remove(struct spi_device *spi)
 {
